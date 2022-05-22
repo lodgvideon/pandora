@@ -6,6 +6,7 @@
 package coreimport
 
 import (
+	"github.com/yandex/pandora/core/aggregator/clickhouse"
 	"reflect"
 
 	"github.com/spf13/afero"
@@ -80,6 +81,7 @@ func Import(fs afero.Fs) {
 	}, netsample.DefaultPhoutConfig)
 	register.Aggregator("jsonlines", aggregator.NewJSONLinesAggregator, aggregator.DefaultJSONLinesAggregatorConfig)
 	register.Aggregator("json", aggregator.NewJSONLinesAggregator, aggregator.DefaultJSONLinesAggregatorConfig) // TODO(skipor): should be done via alias, but we don't have them yet
+	register.Aggregator("raw-clickhouse", clickhouse.NewRawAggregator, clickhouse.NewDefaultConfiguration)
 	register.Aggregator("log", aggregator.NewLog)
 	register.Aggregator("discard", aggregator.NewDiscard)
 

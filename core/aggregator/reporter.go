@@ -36,12 +36,12 @@ func DefaultReporterConfig() ReporterConfig {
 
 func NewReporter(conf ReporterConfig) *Reporter {
 	return &Reporter{
-		Incomming: make(chan core.Sample, conf.SampleQueueSize),
+		Incoming: make(chan core.Sample, conf.SampleQueueSize),
 	}
 }
 
 type Reporter struct {
-	Incomming          chan core.Sample
+	Incoming           chan core.Sample
 	samplesDropped     atomic.Int64
 	lastSampleDropWarn atomic.Int64
 }
@@ -56,7 +56,7 @@ func (a *Reporter) DroppedErr() error {
 
 func (a *Reporter) Report(s core.Sample) {
 	select {
-	case a.Incomming <- s:
+	case a.Incoming <- s:
 	default:
 		a.dropSample(s)
 	}

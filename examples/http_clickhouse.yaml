@@ -1,0 +1,43 @@
+pools:
+  - id: HTTP pool
+    gun:
+      type: http
+      target: example.com:80
+      dial:
+        timeout: 1s
+    ammo:
+      type: http/json
+      file: ./examples/http.jsonline
+    result:
+      type: raw-clickhouse
+      sample-queue-size: 3000000
+      address: 127.0.0.1:9000
+      database: pandora_stats
+      username: default
+      password: default
+      batch_size: 500
+      max_connections: 10
+      max_iddle: 1
+      conn_lifetime: 1h
+      profile: simpe_http_test
+      hostname: localhost
+      define_ddl: true
+
+    rps:
+      type: line
+      from: 5
+      to: 5
+      duration: 500s
+    startup:
+      type: once
+      times: 5
+log:
+  level: debug
+monitoring:
+  expvar:
+    enabled: true
+    port: 1234
+  cpuprofile:
+    enabled: true
+  memprofile:
+    enabled: true

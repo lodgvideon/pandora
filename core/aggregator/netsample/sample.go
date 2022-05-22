@@ -82,6 +82,12 @@ func (s *Sample) SetErr(err error) {
 func (s *Sample) get(k int) int                      { return s.fields[k] }
 func (s *Sample) set(k, v int)                       { s.fields[k] = v }
 func (s *Sample) setDuration(k int, d time.Duration) { s.set(k, int(d.Nanoseconds()/1000)) }
+func (s *Sample) Duration() int                      { return s.get(keyRTTMicro) }
+
+func (s *Sample) Timestamp() time.Time {
+	return s.timeStamp
+}
+
 func (s *Sample) setRTT() {
 	if s.get(keyRTTMicro) == 0 {
 		s.setDuration(keyRTTMicro, time.Since(s.timeStamp))

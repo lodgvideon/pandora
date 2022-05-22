@@ -115,7 +115,7 @@ func (a *dataSinkAggregator) Run(ctx context.Context, deps core.AggregatorDeps) 
 HandleLoop:
 	for {
 		select {
-		case sample := <-a.Incomming:
+		case sample := <-a.Incoming:
 			err = a.handleSample(encoder, sample)
 			if err != nil {
 				return
@@ -136,7 +136,7 @@ HandleLoop:
 
 	for {
 		select {
-		case sample := <-a.Incomming:
+		case sample := <-a.Incoming:
 			err = a.handleSample(encoder, sample)
 			if err != nil {
 				return
