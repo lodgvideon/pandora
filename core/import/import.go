@@ -7,6 +7,7 @@ package coreimport
 
 import (
 	"github.com/yandex/pandora/core/aggregator/clickhouse"
+	"github.com/yandex/pandora/core/engine"
 	"reflect"
 
 	"github.com/spf13/afero"
@@ -81,7 +82,10 @@ func Import(fs afero.Fs) {
 	}, netsample.DefaultPhoutConfig)
 	register.Aggregator("jsonlines", aggregator.NewJSONLinesAggregator, aggregator.DefaultJSONLinesAggregatorConfig)
 	register.Aggregator("json", aggregator.NewJSONLinesAggregator, aggregator.DefaultJSONLinesAggregatorConfig) // TODO(skipor): should be done via alias, but we don't have them yet
-	register.Aggregator("raw-clickhouse", clickhouse.NewRawAggregator, clickhouse.NewDefaultConfiguration)
+	register.Aggregator("clickhouse/phout", func(conf clickhouse.Config) (core.Aggregator, error) {
+		return clickhouse.NewAggregator(fs, conf)
+	}, clickhouse.NewDefaultConfiguration)
+
 	register.Aggregator("log", aggregator.NewLog)
 	register.Aggregator("discard", aggregator.NewDiscard)
 
@@ -93,10 +97,36 @@ func Import(fs afero.Fs) {
 	register.Limiter(compositeScheduleKey, schedule.NewCompositeConf)
 
 	config.AddTypeHook(sinkStringHook)
+	config.AddTypeHook(clickhouseHook)
 	config.AddTypeHook(scheduleSliceToCompositeConfigHook)
 
 	// Required for decoding plugins. Need to be added after Composite Schedule hacky hook.
 	pluginconfig.AddHooks()
+}
+
+func clickhouseHook(r reflect.Type, t reflect.Type, props interface{}) (p interface{}, err error) {
+	p, err = props, nil
+	if t != reflect.TypeOf(engine.InstancePoolConfig{}) {
+		return
+	}
+	newProps := props
+	propsMap, res := newProps.(map[interface{}]interface{})
+	if !res {
+		return
+	}
+	resultProps, res := propsMap["result"]
+	if !res {
+		return
+	}
+
+	resultPropsMap, res := resultProps.(map[interface{}]interface{})
+	if !res {
+		return
+	}
+	if resultPropsMap["type"] == "phout" {
+		resultPropsMap["type"] = "clickhouse/phout"
+	}
+	return props, nil
 }
 
 var (

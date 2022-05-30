@@ -4,6 +4,7 @@ import (
 	"context"
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"github.com/spf13/afero"
 	"github.com/yandex/pandora/core"
 	"github.com/yandex/pandora/core/aggregator"
 	"github.com/yandex/pandora/core/aggregator/netsample"
@@ -15,13 +16,24 @@ import (
 
 type Aggregator struct {
 	aggregator.Reporter
-	ClickhouseConfig Config
-	Conn             driver.Conn
-	currentSize      uint32
-	batch            driver.Batch
+	PhoutAggregator netsample.Aggregator
+	Config          ClickhouseConfig
+	Conn            driver.Conn
+	currentSize     uint32
+	batch           driver.Batch
 }
 
-func NewRawAggregator(clickhouseConfig Config) *Aggregator {
+func NewAggregator(fs afero.Fs, conf Config) (core.Aggregator, error) {
+	phout, err := netsample.NewPhout(fs, conf.Phout)
+	if err != nil {
+		return nil, err
+	}
+	if !conf.ClickhouseConfig.Enabled {
+		return netsample.WrapAggregator(phout), nil
+	}
+	return NewRawAggregator(conf.ClickhouseConfig, phout), nil
+}
+func NewRawAggregator(clickhouseConfig ClickhouseConfig, aggr netsample.Aggregator) *Aggregator {
 
 	conn, err := clickhouse.Open(&clickhouse.Options{
 		Addr: []string{clickhouseConfig.Address},
@@ -35,13 +47,13 @@ func NewRawAggregator(clickhouseConfig Config) *Aggregator {
 		//	InsecureSkipVerify: true,
 		//},
 		Settings: clickhouse.Settings{
-			"max_execution_time": 120,
+			"max_execution_time": clickhouseConfig.MaxExecutionTime,
 		},
 		DialTimeout: 5 * time.Second,
 		Compression: &clickhouse.Compression{
 			Method: clickhouse.CompressionLZ4,
 		},
-		Debug: true,
+		Debug: clickhouseConfig.Debug,
 	})
 	if clickhouseConfig.IsDefineDDL {
 		var CreateDatabaseDdl = "create database IF NOT EXISTS " + clickhouseConfig.Database
@@ -139,34 +151,34 @@ func NewRawAggregator(clickhouseConfig Config) *Aggregator {
 
 	}
 
-	return &Aggregator{ClickhouseConfig: clickhouseConfig, Conn: conn, batch: batch, Reporter: *aggregator.NewReporter(clickhouseConfig.ReporterConfig)}
+	return &Aggregator{
+		Config:          clickhouseConfig,
+		Conn:            conn,
+		PhoutAggregator: aggr,
+		currentSize:     0,
+		batch:           batch,
+		Reporter:        *aggregator.NewReporter(clickhouseConfig.ReporterConfig),
+	}
 }
 
 func (c *Aggregator) Run(ctx context.Context, deps core.AggregatorDeps) (err error) {
-HandleLoop:
-	for {
-		select {
-		case sample := <-c.Incoming:
-			err := c.handleSample(sample)
-			if err != nil {
-				log.Panic(err.Error())
-				return err
-			}
-		case <-ctx.Done():
-			break HandleLoop // Still need to handle all queued samples.
-		}
+	phoutCtx, cancelFunc := context.WithCancel(context.Background())
+	defer cancelFunc()
+	phoutDone := make(chan error)
+	go func() {
+		phoutDone <- c.PhoutAggregator.Run(phoutCtx, deps)
+	}()
+	clickhouseDone := make(chan error)
+	go func() { clickhouseDone <- c.run(ctx, deps) }()
+	select {
+	case clickhouseErr := <-clickhouseDone:
+		return clickhouseErr
+	case phoutErr := <-phoutDone:
+		return phoutErr
 	}
-	//Final send after Shoot Finished
-	if c.currentSize > 0 {
-		err := c.batch.Send()
-		if err != nil {
-			log.Println("Error during final Batch", err)
-		}
-	}
-	return
 }
 func (c *Aggregator) getBatch(ctx context.Context) (driver.Batch, error) {
-	batch, err := c.Conn.PrepareBatch(ctx, "INSERT INTO "+c.ClickhouseConfig.Database+".pandora_results")
+	batch, err := c.Conn.PrepareBatch(ctx, "INSERT INTO "+c.Config.Database+".pandora_results")
 	if err != nil {
 		log.Print("Error during creating batch", err)
 	}
@@ -192,24 +204,12 @@ func (c *Aggregator) handleSample(sample core.Sample) (err error) {
 		e = s.Err().Error()
 
 	}
-	//	"\ttimestamp_sec DateTime,\n" +
-	//			"\ttimestamp_millis UInt64,\n" +
-	//			"\tprofile LowCardinality(String),\n" +
-	//			"\trun_id LowCardinality(String),\n" +
-	//			"\thostname LowCardinality(String),\n" +
-	//			"\tlabel LowCardinality(String),\n" +
-	//			"\tcnt UInt64,\n" +
-	//			"\terrors UInt64,\n" +
-	//			"\tavg_time Float64,\n" +
-	//			"\treq String,\n" +
-	//			"\tresp String,\n" +
-	//			"\tnet_code LowCardinality(String)\n" +
 	err = c.batch.Append(
 		s.Timestamp(),
 		uint64(s.Timestamp().UnixMilli()),
-		c.ClickhouseConfig.ProfileName,
-		c.ClickhouseConfig.RunId,
-		c.ClickhouseConfig.Hostname,
+		c.Config.ProfileName,
+		c.Config.RunId,
+		c.Config.Hostname,
 		tags,
 		uint64(1),
 		uint64(errorCount),
@@ -224,7 +224,7 @@ func (c *Aggregator) handleSample(sample core.Sample) (err error) {
 	}
 	c.currentSize++
 
-	if c.currentSize >= c.ClickhouseConfig.BatchSize {
+	if c.currentSize >= c.Config.BatchSize {
 		err := c.batch.Send()
 		if err != nil {
 			log.Panic("Error during sending batch")
@@ -232,43 +232,91 @@ func (c *Aggregator) handleSample(sample core.Sample) (err error) {
 		c.batch = nil
 		c.currentSize = 0
 	}
-
+	c.PhoutAggregator.Report(s)
 	coreutil.ReturnSampleIfBorrowed(sample)
 	return
 }
 
+func (c *Aggregator) run(ctx context.Context, deps core.AggregatorDeps) (err error) {
+HandleLoop:
+	for {
+		select {
+		case sample := <-c.Incoming:
+			err = c.handleSample(sample)
+			if err != nil {
+				deps.Log.Error(err.Error())
+				return
+			}
+		case <-ctx.Done():
+			break HandleLoop // Still need to handle all queued samples.
+		}
+	}
+	//Final send after Shoot Finished
+	if c.currentSize > 0 {
+		err = c.batch.Send()
+		if err != nil {
+			log.Println("Error during final Batch", err)
+		}
+	}
+	for {
+		select {
+		case sample := <-c.Incoming:
+			err = c.handleSample(sample)
+			if err != nil {
+				return
+			}
+		default:
+			return nil
+		}
+	}
+
+}
+
 type Config struct {
-	Address         string                    `config:"address" validate:"required"`
-	Database        string                    `config:"database" validate:"required"`
-	Username        string                    `config:"username" validate:"required"`
-	Password        string                    `config:"password" validate:"required"`
-	BatchSize       uint32                    `config:"batch_size" validate:"required"`
-	MaxOpenConns    int                       `config:"max_connections"`
-	MaxIdleConns    uint32                    `config:"max_iddle"`
-	ConnMaxLifetime time.Duration             `config:"conn_lifetime" validate:"required"`
-	ReporterConfig  aggregator.ReporterConfig `config:",squash"`
-	ProfileName     string                    `config:"profile" validate:"required"`
-	RunId           string                    `config:"run_id" validate:"required"`
-	Hostname        string                    `config:"hostname" validate:"required"`
-	IsDefineDDL     bool                      `config:"define_ddl"`
+	Phout            netsample.PhoutConfig `config:",squash"`
+	ClickhouseConfig ClickhouseConfig      `config:"clickhouse_config"`
+}
+
+type ClickhouseConfig struct {
+	Address          string                    `config:"address" validate:"required"`
+	Database         string                    `config:"database" validate:"required"`
+	Username         string                    `config:"username" validate:"required"`
+	Password         string                    `config:"password" validate:"required"`
+	BatchSize        uint32                    `config:"batch_size" validate:"required"`
+	MaxOpenConns     int                       `config:"max_connections"`
+	MaxIdleConns     uint32                    `config:"max_iddle"`
+	MaxExecutionTime uint32                    `config:"max_execution_time"`
+	ConnMaxLifetime  time.Duration             `config:"conn_lifetime" validate:"required"`
+	ReporterConfig   aggregator.ReporterConfig `config:",squash"`
+	ProfileName      string                    `config:"profile" validate:"required"`
+	RunId            string                    `config:"run_id" validate:"required"`
+	Hostname         string                    `config:"hostname" validate:"required"`
+	IsDefineDDL      bool                      `config:"define_ddl"`
+	Enabled          bool                      `config:"clickhouse_enabled"`
+	Debug            bool                      `config:"debug"`
 }
 
 func NewDefaultConfiguration() Config {
 	return Config{
-		Address:         "127.0.0.1:9000",
-		Database:        "pandora_stats",
-		Username:        "default",
-		Password:        "default",
-		BatchSize:       500,
-		MaxOpenConns:    10,
-		MaxIdleConns:    5,
-		ConnMaxLifetime: time.Hour,
-		ReporterConfig: aggregator.ReporterConfig{
-			SampleQueueSize: 3_000_000,
-		},
-		ProfileName: "default",
-		RunId:       time.Now().String(),
-		Hostname:    "localhost",
-		IsDefineDDL: true,
-	}
+		Phout: netsample.DefaultPhoutConfig(),
+		ClickhouseConfig: ClickhouseConfig{
+			Enabled:  false,
+			Address:  "127.0.0.1:9000",
+			Database: "pandora_stats",
+			Username: "default",
+			Password: "default",
+			ReporterConfig: aggregator.ReporterConfig{
+				SampleQueueSize: 300000,
+			},
+			BatchSize:        500,
+			MaxExecutionTime: 120,
+			MaxOpenConns:     10,
+			MaxIdleConns:     5,
+			Debug:            false,
+			ConnMaxLifetime:  time.Hour,
+			ProfileName:      "default",
+			RunId:            time.Now().String(),
+			Hostname:         "localhost",
+			IsDefineDDL:      true,
+		}}
 }
