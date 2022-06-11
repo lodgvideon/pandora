@@ -226,10 +226,6 @@ func (c *Aggregator) handleSample(sample core.Sample) (err error) {
 	c.currentSize++
 
 	if c.currentSize >= c.Config.BatchSize {
-		err := c.batch.Send()
-		if err != nil {
-			zap.L().Warn("Error during appending to Batch", zap.Error(err))
-		}
 		c.TrySendBatch(&c.batch, 0)
 		c.batch = nil
 		c.currentSize = 0
