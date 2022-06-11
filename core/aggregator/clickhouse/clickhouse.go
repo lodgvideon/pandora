@@ -9,6 +9,7 @@ import (
 	"github.com/yandex/pandora/core/aggregator"
 	"github.com/yandex/pandora/core/aggregator/netsample"
 	"github.com/yandex/pandora/core/coreutil"
+	"go.uber.org/zap"
 	"log"
 	"strconv"
 	"time"
@@ -16,6 +17,7 @@ import (
 
 type Aggregator struct {
 	aggregator.Reporter
+	Log             *zap.Logger
 	PhoutAggregator netsample.Aggregator
 	Config          ClickhouseConfig
 	Conn            driver.Conn
@@ -38,17 +40,15 @@ func NewRawAggregator(clickhouseConfig ClickhouseConfig, aggr netsample.Aggregat
 	conn, err := clickhouse.Open(&clickhouse.Options{
 		Addr: []string{clickhouseConfig.Address},
 		Auth: clickhouse.Auth{
-			//Database: clickhouseConfig.Database,
 			Username: clickhouseConfig.Username,
 			Password: clickhouseConfig.Password,
 		},
+
 		MaxOpenConns: clickhouseConfig.MaxOpenConns,
-		//TLS: &tls.Config{
-		//	InsecureSkipVerify: true,
-		//},
 		Settings: clickhouse.Settings{
 			"max_execution_time": clickhouseConfig.MaxExecutionTime,
 		},
+
 		DialTimeout: 5 * time.Second,
 		Compression: &clickhouse.Compression{
 			Method: clickhouse.CompressionLZ4,
@@ -59,7 +59,7 @@ func NewRawAggregator(clickhouseConfig ClickhouseConfig, aggr netsample.Aggregat
 		var CreateDatabaseDdl = "create database IF NOT EXISTS " + clickhouseConfig.Database
 		err := conn.Exec(context.Background(), CreateDatabaseDdl)
 		if err != nil {
-			log.Panic(err)
+			zap.L().Panic("Unable to create database", zap.Error(err))
 		}
 		var createTableDdl = "create table IF NOT EXISTS" +
 			"    " + clickhouseConfig.Database + ".pandora_raw_results_data" +
@@ -78,7 +78,7 @@ func NewRawAggregator(clickhouseConfig ClickhouseConfig, aggr netsample.Aggregat
 
 		err = conn.Exec(context.Background(), createTableDdl)
 		if err != nil {
-			log.Panic(err)
+			zap.L().Panic("Unable to create Table pandora_raw_results_data", zap.Error(err))
 		}
 		var templateStatsDDL = "CREATE MATERIALIZED VIEW IF NOT EXISTS " +
 			clickhouseConfig.Database + ".pandora_statistic (\n" +
@@ -118,7 +118,8 @@ func NewRawAggregator(clickhouseConfig ClickhouseConfig, aggr netsample.Aggregat
 			clickhouseConfig.Database + ".pandora_raw_results_data"
 		err = conn.Exec(context.Background(), templateStatsDDL)
 		if err != nil {
-			log.Panic(err)
+			zap.L().Panic("Unable to create Table MATERIALIZED VIEW Pandora_statistic", zap.Error(err))
+
 		}
 
 		var dbTemplateBuff = "create table IF NOT EXISTS " +
@@ -141,14 +142,13 @@ func NewRawAggregator(clickhouseConfig ClickhouseConfig, aggr netsample.Aggregat
 			" engine = Buffer(" + clickhouseConfig.Database + ", pandora_raw_results_data, 16, 10, 60, 10000, 100000, 1000000, 10000000)"
 		err = conn.Exec(context.Background(), dbTemplateBuff)
 		if err != nil {
-			log.Panic(err)
+			zap.L().Panic("Unable to create Table pandora_results", zap.Error(err))
 		}
 	}
 
 	batch, err := conn.PrepareBatch(context.Background(), "INSERT INTO "+clickhouseConfig.Database+".pandora_results")
 	if err != nil {
-		log.Panic("Unable to create Clickhouse Connection")
-
+		zap.L().Panic("Unable to create first Batch", zap.Error(err))
 	}
 
 	return &Aggregator{
@@ -194,6 +194,7 @@ func (c *Aggregator) handleSample(sample core.Sample) (err error) {
 	}
 	var errorCount = 0
 	s := sample.(*netsample.Sample)
+	c.PhoutAggregator.Report(s)
 	if s.Err() != nil {
 		errorCount = 1
 	}
@@ -220,21 +221,35 @@ func (c *Aggregator) handleSample(sample core.Sample) (err error) {
 		e,
 	)
 	if err != nil {
-		log.Panic("Error during appending to Batch", err)
+		zap.L().Warn("Error during appending to Batch", zap.Error(err))
 	}
 	c.currentSize++
 
 	if c.currentSize >= c.Config.BatchSize {
 		err := c.batch.Send()
 		if err != nil {
-			log.Panic("Error during sending batch")
+			zap.L().Warn("Error during appending to Batch", zap.Error(err))
 		}
+		c.TrySendBatch(&c.batch, 0)
 		c.batch = nil
 		c.currentSize = 0
 	}
-	c.PhoutAggregator.Report(s)
 	coreutil.ReturnSampleIfBorrowed(sample)
 	return
+}
+
+func (c *Aggregator) TrySendBatch(batch *driver.Batch, recursionDepth int) {
+	if recursionDepth < 10 {
+		i := *batch
+		err := i.Send()
+		if err != nil {
+			zap.L().Warn("Error during appending to Batch", zap.Error(err))
+			c.TrySendBatch(batch, recursionDepth+1)
+		}
+	} else {
+		zap.L().Warn("Send Batch Retries Exceed. Dropping current Batch. Check your clickhouse Settings")
+	}
+
 }
 
 func (c *Aggregator) run(ctx context.Context, deps core.AggregatorDeps) (err error) {
